@@ -13,7 +13,7 @@ using namespace proto;
 namespace kv {
 
 // 三种竞选类型的标识（塞进消息 context 里传给其他节点，判断投票时用）
-static const std::string kCampaignPreElection ="CampaignPreElection";  // 预投票
+static const std::string kCampaignPreElection = "CampaignPreElection";  // 预投票                                 
 static const std::string kCampaignElection = "CampaignElection";  // 正式选举
 static const std::string kCampaignTransfer = "CampaignTransfer";  // 领导权转移
 
@@ -56,7 +56,6 @@ Raft::Raft(const Config& conf)
       disableProposalForwarding_(conf.disableProposalForwarding),
       randomDevice_(0, conf.electionTick),
       clusterInfo_(conf.clusterInfo) {
-    
     // 连接 zookeeper（leader 当选后要向 zk 注册服务地址）
     zkClient_.Start();
 
@@ -89,7 +88,6 @@ Raft::Raft(const Config& conf)
             peers.emplace_back(node);
         }
     }
-
 
     // 为每个集群成员创建一个"复制进度"(next 从 1 开始, 等日志加载后纠正)
     for (uint64_t peer : peers) {
@@ -185,7 +183,7 @@ void Raft::BecomeCandidate() {
     LOG_INFO("%lu became candidate at term %lu", id_, term_);
 }
 
-// 变成"领导者"：选举获胜后的庆祝仪式+初始化
+// 变成"领导者"：选举获胜后的庆祝仪式+初始化, 上报 zk;
 void Raft::BecomeLeader() {
     if (state_ == proto::RaftRole::Follower) {
         LOG_FATAL("invalid transition [follower -> leader]");
@@ -263,7 +261,7 @@ void Raft::Campaign(const std::string& campaignType) {
         voteMsg = MessageType::MsgPreVote;
         term = term_ + 1;  // 预投票 RPC 在增加任期前为下一任期发送
     } else {
-        // 正式选举（或领导权转移）：进入新任期，发 MsgVote
+        // 正式选举（或领导权转移）: 进入新任期，发 MsgVote
         BecomeCandidate();
         voteMsg = MessageType::MsgVote;
         term = term_;
@@ -360,17 +358,21 @@ uint32_t Raft::Poll(uint64_t id, proto::MessageType type, bool v) {
 Status Raft::Step(std::shared_ptr<Message> msg) {
     // ---- 任期检查 ----
     if (msg->term() == 0) {
-        // 本地消息（MsgHup/MsgBeat 等）不带任期，跳过任期检查
+        // 本地消息(MsgHup/MsgBeat/等)或者 EntryNormal类型消息, 不带任期,
+        // 跳过任期检查;
     } else if (msg->term() > term_) {
         // 消息来自更高的任期：说明集群里出现了新纪元（新选举或新leader）
-        if (msg->type() == MessageType::MsgVote || msg->type() == MessageType::MsgPreVote) {
+        if (msg->type() == MessageType::MsgVote ||
+            msg->type() == MessageType::MsgPreVote) {
             // 特殊场景: 领导权转移的投票请求，必须强制响应;
-            bool force =  (Slice((const char*)msg->context().data(),
+            bool force =
+                (Slice((const char*)msg->context().data(),
                        msg->context().size()) == Slice(kCampaignTransfer));
             // 租约保护: 如果我在当前 leader 的"租约期"内
             // （checkQuorum 开启 && 有 leader && 还没到选举超时），
             // 就不理这个投票请求——因为现任 leader 明明还活着
-            bool in_lease = (checkQuorum_ && lead_ != 0 && electionElapsed_ < electionTimeout_);
+            bool in_lease = (checkQuorum_ && lead_ != 0 &&
+                             electionElapsed_ < electionTimeout_);
             // 不用强制回复 && 在租期内
             if (!force && in_lease) {
                 // 在租约期内收到更高任期的投票请求，不更新任期、不投票
@@ -428,7 +430,6 @@ Status Raft::Step(std::shared_ptr<Message> msg) {
         }
     } else if (msg->term() < term_) {
         // 消息来自更低的任期：通常是网络延迟的旧消息
-
         if ((checkQuorum_ || preVote_) &&
             (msg->type() == MessageType::MsgHeartbeat ||
              msg->type() == MessageType::MsgApp)) {
@@ -440,7 +441,7 @@ Status Raft::Step(std::shared_ptr<Message> msg) {
             std::shared_ptr<Message> m(new Message());
             m->set_to(msg->from());
             m->set_type(MessageType::MsgAppResp);
-            // m->set_term(term_); 源码没加;
+            m->set_term(term_);  // 源码没加;
             Send(std::move(m));
 
         } else if (msg->type() == MessageType::MsgPreVote) {
@@ -474,7 +475,8 @@ Status Raft::Step(std::shared_ptr<Message> msg) {
     // 任期对, 角色对, 那就是正常消息:
     // ---- 按消息类型处理 ----
     switch (msg->type()) {
-        // 是 Raft 里的"开始选举"消息——而且它是本节点发给自己的本地消息，永远不出现在网络上;
+        // 是 Raft
+        // 里的"开始选举"消息——而且它是本节点发给自己的本地消息，永远不出现在网络上;
         // 以前是超时到了就直接发起选举; 这里是到了超时时间后,
         // 再去判断一些是否还有配置变更的消息;
         // 否则不能进行选举,要先执行配置变更? 非leader 也能执行配置变更;
@@ -548,7 +550,8 @@ Status Raft::Step(std::shared_ptr<Message> msg) {
 
             // 候选人日志是否足够新（Raft 选举限制：
             // 日志更旧的人当选会导致已提交日志丢失）
-            if (can_vote && this->raftLog_->IsUpToDate(msg->index(), msg->logterm())) {
+            if (can_vote &&
+                this->raftLog_->IsUpToDate(msg->index(), msg->logterm())) {
                 LOG_INFO(
                     "%lu [logTerm: %lu, index: %lu, vote: %lu] "
                     "cast %s for %lu [logTerm: %lu, index: "
@@ -592,7 +595,6 @@ Status Raft::Step(std::shared_ptr<Message> msg) {
                 m->set_reject(true);
                 Send(std::move(m));
             }
-
             break;
         }
         default: {
@@ -693,17 +695,18 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
 
             // 追加到 raft unstable 中;
             if (!AppendEntry(entries)) {
+                // 会尝试提交, 但是还没下发,会提交失败;
                 return Status::InvalidArgument("raft proposal dropped");
             }
 
             LOG_INFO("broadcast append entries");
 
-            // 广播给所有 follower 复制
+            // 广播给所有 follower 复制;
             BcastAppend();
             return Status::Ok();
         }
 
-        // 用户的读请求类型: MsgReadIndex;消息类型：线性一致读
+        // 用户的读请求类型: MsgReadIndex;消息类型: 线性一致读;
         case MessageType::MsgReadIndex: {
             if (Quorum() > 1) {
                 // 取当前提交索引的任期
@@ -752,7 +755,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                                               msg->entries(0).data().begin(),
                                               msg->entries(0).data().end())});
                         } else {
-                            // 远程节点转发的读：
+                            // 远程节点转发的读;
                             // 直接把 commit
                             // 索引回给它
                             std::shared_ptr<proto::Message> m(new Message());
@@ -847,7 +850,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                     // 都过了某条日志， 它就被"提交"了
                     if (MaybeCommit()) {
                         // 把推进后的结果, 广播给所有人;
-                        BcastAppend();  // 提交推进，广播给所有人;
+                        BcastAppend();  // 提交推进, 广播给所有人;
                     } else if (old_paused) {
                         // 之前暂停的节点可能不知道最新提交，
                         // 补发一条
@@ -902,22 +905,24 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                 return Status::Ok();
             }
 
-            // 统计确认数：加上 leader 自己，够多数派才解锁读请求
+            // 统计确认数: 加上 leader 自己, 够多数派才解锁读请求;
             uint32_t ack_count = readOnly_->RecvAck(*msg);
             LOG_INFO("ack_count = %d, from = %d", ack_count, msg->from());
             if (ack_count < Quorum()) {
                 return Status::Ok();  // 还没到多数派，继续等;
             }
 
-            // 到多数派了：解锁该请求及之前的所有请求
+            // 到多数派了: 解锁该请求及之前的所有请求
             std::vector<ReadIndexStatusPtr> rss = readOnly_->Advance(*msg);
-            // 判断每一个请求是否是发给自己的（本地读）还是发给别的节点（远程读）
+
+            // 判断每一个请求是否是发给自己的（本地读）还是发给别的节点(远程读)转发到这里的;
             for (ReadIndexStatusPtr& rs : rss) {
                 // 消息体
                 proto::Message& req = rs->req;
-                if (req.from() == 0 || req.from() == id_)  // 请求是客户端发给自己的
+                if (req.from() == 0 ||
+                    req.from() == id_)  // 请求是客户端发给自己的
                 {
-                    // 本地读：把读的申请结果放进 readStates_，
+                    // 本地读: 把读的申请结果放进 readStates_，
                     // 上层检查 appliedIndex 后执行读取
                     ReadState read_state =
                         ReadState{.index = rs->index,
@@ -927,7 +932,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                     readStates_.push_back(std::move(read_state));
                 } else  // 请求是客户端发给别的节点的, 其他节点再发给当前节点;
                 {
-                    // 远程读：把安全水位回给那个节点
+                    // 远程读: 把安全水位回给那个节点
                     std::shared_ptr<proto::Message> m(new proto::Message());
                     m->set_to(req.from());
                     m->set_type(proto::MessageType::MsgReadIndexResp);
@@ -940,7 +945,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
         } break;
 
         // 快照发送结果的汇报（上层调 ReportSnapshot 触发）
-        case MessageType::MsgSnapStatus: {  
+        case MessageType::MsgSnapStatus: {
             if (pr->state_ != ProgressStateSnapshot) {
                 return Status::Ok();
             }
@@ -985,7 +990,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
         case MessageType::MsgTransferLeader: {
             uint64_t lead_transferee = msg->from();
             uint64_t last_lead_transferee = leadTransferee_;
-           
+
             // 先本地检查目标节点;
             if (last_lead_transferee != 0) {
                 // 已经在转移中, 并且相等;
@@ -1008,7 +1013,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
             }
 
             // 目标就是自己(已经是 leader),忽略;
-            if (lead_transferee == id_) {   
+            if (lead_transferee == id_) {
                 LOG_DEBUG(
                     "%lu is already leader. Ignored "
                     "transferring leadership to self",
@@ -1054,7 +1059,7 @@ Status Raft::StepCandidate(std::shared_ptr<Message> msg) {
     switch (msg->type()) {
         // 竞选期间收到提案：集群里可能没 leader，丢提案
         case MessageType::MsgProp:
-            LOG_INFO("%lu no leader at term %lu; dropping proposal", id_,term_);
+            LOG_INFO("%lu no leader at term %lu; dropping proposal", id_, term_);
             return Status::InvalidArgument("raft proposal dropped");
 
         // 收到 leader 的追加日志：说明对方是合法 leader，让位
@@ -1062,22 +1067,23 @@ Status Raft::StepCandidate(std::shared_ptr<Message> msg) {
             BecomeFollower(msg->term(), msg->from());
             HandleAppendEntries(std::move(msg));
             break;
-        
+
             // 收到 leader 心跳：让位
         case MessageType::MsgHeartbeat:
             BecomeFollower(msg->term(), msg->from());
             HandleHeartbeat(std::move(msg));
             break;
+            
         // 收到 leader 快照：让位
         case MessageType::MsgSnap:
             BecomeFollower(msg->term(), msg->from());
             HandleSnapshot(std::move(msg));
             break;
-        
-        // 收到投票回复：计票 
+
+        // 收到投票回复：计票
         case MessageType::MsgPreVoteResp:
         case MessageType::MsgVoteResp: {
-           // 计算赞成票数（包括自己）和反对票数
+            // 计算赞成票数（包括自己）和反对票数
             uint64_t gr = Poll(msg->from(), msg->type(), !msg->reject());
             LOG_INFO(
                 "%lu [quorum:%u] has received %lu %s votes and %lu "
@@ -1123,8 +1129,8 @@ Status Raft::StepFollower(std::shared_ptr<Message> msg) {
         // 客户端发来的提案消息（写请求）
         case MessageType::MsgProp:
             // 默认转发给 leader（disableProposalForwarding 可关闭）
-        // 不知道 leader 是谁（刚启动/选举中）：丢提案
-            if (lead_ == 0) {       
+            // 不知道 leader 是谁（刚启动/选举中）：丢提案
+            if (lead_ == 0) {
                 LOG_INFO(
                     "%lu no leader at term %lu; dropping "
                     "proposal",
@@ -1141,15 +1147,16 @@ Status Raft::StepFollower(std::shared_ptr<Message> msg) {
             // 转发给 leader
             msg->set_to(lead_);
             LOG_INFO("send msg to leader, MsgProp");
-            
+
             // leader的回复消息给谁?
             Send(msg);
             break;
-        
+
             // 收到 leader 的追加日志
-        case MessageType::MsgApp: {  
+        case MessageType::MsgApp: {
             electionElapsed_ = 0;  // 重置选举计时（leader 还活着）
             lead_ = msg->from();
+            //
             HandleAppendEntries(msg);
             LOG_INFO("send msg to leader, MsgApp");
             break;
@@ -1164,7 +1171,7 @@ Status Raft::StepFollower(std::shared_ptr<Message> msg) {
         }
 
         // 收到 leader 的快照
-        case MessageType::MsgSnap: {    
+        case MessageType::MsgSnap: {
             electionElapsed_ = 0;
             lead_ = msg->from();
             HandleSnapshot(msg);
@@ -1186,7 +1193,7 @@ Status Raft::StepFollower(std::shared_ptr<Message> msg) {
             Send(msg);
             break;
 
-        // 收到 MsgTimeoutNow：leader 让我立刻发起选举（交接班）
+        // 收到 MsgTimeoutNow: leader 让我立刻发起选举（交接班）
         case MessageType::MsgTimeoutNow:
             // 本节点是否够格参与选举：自己的 id 在进度表里
             if (Promotable()) {
@@ -1207,7 +1214,7 @@ Status Raft::StepFollower(std::shared_ptr<Message> msg) {
             }
             break;
 
-        // 客户端读请求发到了 follower：转发给 leader 处理
+        // 客户端读请求发到了 follower：转发给 leader 处理;
         case MessageType::MsgReadIndex:
             if (lead_ == 0) {
                 LOG_INFO(
@@ -1219,8 +1226,8 @@ Status Raft::StepFollower(std::shared_ptr<Message> msg) {
             msg->set_to(lead_);
             Send(msg);
             break;
-        
-        // 收到 leader 返回的安全水位：可以执行读取了;
+
+        // 收到 leader 返回的安全水位: 可以执行读取了;
         case MessageType::MsgReadIndexResp:
             if (msg->entries().size() != 1) {
                 LOG_ERROR(
@@ -1257,12 +1264,14 @@ void Raft::Send(std::shared_ptr<Message> msg) {
         msg->type() == MessageType::MsgPreVoteResp) {
         // 所有 {预}竞选消息在发送时都必须设置 term
         if (msg->term() == 0) {
-            LOG_FATAL("term should be set when sending %s", MsgTypeToString(msg->type()));
+            LOG_FATAL("term should be set when sending %s",
+                      MsgTypeToString(msg->type()));
         }
     } else {
         // 其他消息不应该带任期(避免接收方误判任期)
         if (msg->term() != 0) {
-            LOG_FATAL("term should not be set when sending %d (was %lu)", msg->type(), msg->term());
+            LOG_FATAL("term should not be set when sending %d (was %lu)",
+                      msg->type(), msg->term());
         }
 
         // MsgProp: 本地消息. "提案"（客户端写请求进入 Raft 的第一步）
@@ -1328,7 +1337,7 @@ void Raft::HandleAppendEntries(std::shared_ptr<Message> msg) {
                           std::move(entries), lastIndex, ok);
 
     if (ok) {
-        // 接受：回复 leader"我收到了，日志到 lastIndex"
+        // 接受: 回复 leader"我收到了, 日志到 lastIndex"
         std::shared_ptr<Message> m(new Message());
         m->set_to(msg->from());
         m->set_type(MessageType::MsgAppResp);
@@ -1479,12 +1488,12 @@ void Raft::LoadState(const proto::HardState& state) {
     uint64_t high = raftLog_->LastIndex();
 
     if (commit < low) {
-        LOG_WARN("%lu state.commit %lu < committed %lu(snapshot), clamp up", id_,
-                 commit, low);
+        LOG_WARN("%lu state.commit %lu < committed %lu(snapshot), clamp up",
+                 id_, commit, low);
         commit = low;
     } else if (commit > high) {
-        LOG_WARN("%lu state.commit %lu > LastIndex %lu, clamp down", id_, commit,
-                 high);
+        LOG_WARN("%lu state.commit %lu > LastIndex %lu, clamp down", id_,
+                 commit, high);
         commit = high;
     }
 
@@ -1543,18 +1552,19 @@ bool Raft::MaybeSendAppend(uint64_t to, bool sendIfEmpty) {
     msg->set_to(to);
     uint64_t term = 0;
 
-    // 取"next-1" 位置的任期（前一条日志的任期，append 对账要用）
+    // 取"next-1" 位置的任期（前一条日志的任期, append 对账要用）
     Status status_term = raftLog_->Term(pr->next_ - 1, term);
     std::vector<std::shared_ptr<proto::Entry>> entries;
 
-    // 从 next 开始取日志（最多 maxMsgSize_ 字节）
+    // 从 next 开始取日志(最多 maxMsgSize_ 字节)
     Status status_entries = raftLog_->Entries(pr->next_, maxMsgSize_, entries);
     if (entries.empty() && !sendIfEmpty) {
         return false;  // 没有新日志且不允许空消息，不发
     }
 
+    // 发送快照
     if (!status_term.IsOk() || !status_entries.IsOk()) {
-        // 日志取不出来（next 已经被压缩掉了）：必须发快照
+        // 日志取不出来（next 已经被压缩掉了）:必须发快照
         if (!pr->recentActive_) {
             // follower 最近不活跃，先不发快照（省带宽，等它活过来）
             LOG_DEBUG(
@@ -1583,24 +1593,26 @@ bool Raft::MaybeSendAppend(uint64_t to, bool sendIfEmpty) {
             "%lu, term: %lu] to %lu [%s]",
             id_, raftLog_->FirstIndex(), raftLog_->committed_, sindex, sterm,
             to, pr->String().c_str());
-        // 进入快照状态，暂停普通复制
+        // 进入快照状态，暂停普通复制;
         pr->BecomeSnapshot(sindex);
         msg->set_allocated_snapshot(snap.get());
         LOG_DEBUG("%lu paused sending replication messages to %lu [%s]", id_,
                   to, pr->String().c_str());
     } else {
-        // 正常发送追加日志
+        // 正常发送追加日志[];
         msg->set_type(proto::MessageType::MsgApp);
         msg->set_index(pr->next_ - 1);  // 前一条日志的索引
         msg->set_logterm(term);         // 前一条日志的任期
+
         for (std::shared_ptr<proto::Entry>& entry : entries) {
             msg->add_entries()->CopyFrom(*entry);
         }
 
-        msg->set_commit(raftLog_->committed_);  // 带上我的提交索引
+        msg->set_commit(raftLog_->committed_);  // 带上 leader 的提交索引;
+
         if (!msg->entries_size() == 0) {
             switch (pr->state_) {
-                // 复制状态：乐观地把 next 前推，同时把
+                // 复制状态: 乐观地把 next 前推，同时把
                 // 最后一条日志索引记入在途窗口
                 case ProgressStateReplicate: {
                     uint64_t last =
@@ -1609,7 +1621,7 @@ bool Raft::MaybeSendAppend(uint64_t to, bool sendIfEmpty) {
                     pr->inflights_->Add(last);
                     break;
                 }
-                // 探测状态：发一条就暂停，等回复确认
+                // 探测状态: 发一条就暂停，等回复确认
                 case ProgressStateProbe: {
                     pr->SetPause();
                     break;
@@ -1623,6 +1635,7 @@ bool Raft::MaybeSendAppend(uint64_t to, bool sendIfEmpty) {
             }
         }
     }
+    // 下发到任务队列中, 等待被提取走;
     Send(std::move(msg));
     return true;
 }
@@ -1656,7 +1669,7 @@ void Raft::BcastAppend() {
         if (id == id_) {
             return;
         }
-        //
+        // 开始复制日志（可能是空日志，带上 commit 进度）
         this->SendAppend(id);
     };
     ForEachProgress(handler);
@@ -1682,9 +1695,9 @@ void Raft::BcastHeartbeatWithCtx(const std::vector<uint8_t>& ctx) {
 }
 
 // ----------------------------------------------------------------------------
-// MaybeCommit：尝试推进提交索引（leader 每收到一次 MsgAppResp 都调用）
+// MaybeCommit: 尝试推进提交索引（leader 每收到一次 MsgAppResp 都调用）
 //
-// 大白话：把所有人的 match 排个序，取"第 Quorum 大"的那个值——
+// 大白话: 把所有人的 match 排个序，取"第 Quorum 大"的那个值——
 // 如果有超过半数的节点 match >= X，那么 X 就有资格被提交。
 // 真正提交前还要检查：第 X 条日志的任期必须是当前任期
 // （Raft 规则：只能提交当前任期的日志）
@@ -1792,7 +1805,7 @@ bool Raft::AppendEntry(const std::vector<Entry>& entries) {
         return false;
     }
 
-    // 写入日志（unstable 区）
+    // 写入日志(unstable 区)
     li = raftLog_->Append(ents);
     // 更新自己的进度（match = 最新日志索引）
     GetProgress(id_)->MaybeUpdate(li);
@@ -1812,7 +1825,7 @@ void Raft::TickElection() {
         std::shared_ptr<Message> msg(new Message());
         msg->set_from(id_);
         msg->set_type(MessageType::MsgHup);
-        // 
+        // 发送拉票请求;
         Step(std::move(msg));
     }
 }

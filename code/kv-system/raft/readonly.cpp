@@ -42,7 +42,7 @@ uint32_t ReadOnly::RecvAck(const proto::Message& msg) {
     return it->second->acks.size() + 1;
 }
 
-// Advance: 确认达到多数派后, 解锁指定请求及之前的所有请求
+// Advance: 确认达到多数派后, 解锁指定请求及之前的所有请求;
 /*
 1. 遍历 readIndexQueue 队列，把每个请求都收进 rss，直到找到 context 对应的那个
 2. 找到后，从队列和 pendingReadIndex 中删除这些已解锁的记录
@@ -68,6 +68,7 @@ std::vector<ReadIndexStatusPtr> ReadOnly::Advance(const proto::Message& msg) {
                 "map");
         }
         rss.push_back(it->second);
+        // 找到可是释放的index位置;
         if (okctx == ctx) {
             found = true;  // 找到目标请求，停止收集;
             break;
@@ -76,8 +77,7 @@ std::vector<ReadIndexStatusPtr> ReadOnly::Advance(const proto::Message& msg) {
 
     if (found) {
         // 从队列里删掉前 i 个（已解锁的）
-        readIndexQueue.erase(readIndexQueue.begin(),
-                             readIndexQueue.begin() + i);
+        readIndexQueue.erase(readIndexQueue.begin(),readIndexQueue.begin() + i);
         // 从映射表里删掉对应的记录
         for (ReadIndexStatusPtr& rs : rss) {
             std::string str(rs->req.entries(0).data().begin(),

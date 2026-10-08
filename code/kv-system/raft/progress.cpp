@@ -153,7 +153,7 @@ bool Progress::IsPaused() const {
     }
 }
 
-// 更新进度：n 比 match_ 大才更新 match_（并恢复暂停），
+// 更新进度: n 比 match_ 大才更新 match_（并恢复暂停）,
 // next_ 总是推进到至少 n+1
 bool Progress::MaybeUpdate(uint64_t n) {
     bool updated = false;

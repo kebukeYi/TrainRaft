@@ -66,7 +66,7 @@ void RaftLog::MaybeAppend(uint64_t index, uint64_t logTerm, uint64_t committed,
             Append(std::move(entries));
         }
 
-        // 推进提交索引（不能超过本次携带的条目末尾）
+        // 推进提交索引(不能超过本次携带的条目末尾)
         CommitTo(std::min(committed, lastnewi));
 
         lastNewIndex = lastnewi;
@@ -97,7 +97,7 @@ uint64_t RaftLog::Append(std::vector<std::shared_ptr<proto::Entry>> entries) {
     }
 
     // 先写入中间层 unstable(暂时认为数据"不太可靠"，还没写盘)
-    // 那么什么时机 就认可写盘了?
+    // 那么什么时机 就认可写盘了? 等待被提取;
     unstable_->TruncateAndAppend(std::move(entries));
 
     return LastIndex();
@@ -238,7 +238,7 @@ Status RaftLog::Slice(uint64_t low, uint64_t high,
     return Status::Ok();
 }
 
-// 推进 committed（只增不减，且不能超过日志最后一条）
+// 推进 committed(只增不减，且不能超过日志最后一条)
 void RaftLog::CommitTo(uint64_t toCommit) {
     if (committed_ < toCommit) {
         if (LastIndex() < toCommit) {

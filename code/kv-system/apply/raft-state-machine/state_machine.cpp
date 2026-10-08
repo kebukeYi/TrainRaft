@@ -131,24 +131,34 @@ void StateMachine::RecoverFromSnapshot(const proto::Snapshot& snap) {
 //   4. 找到当初登记的 RPC 请求（requestid），回包给客户端
 // ============================================================================
 void StateMachine::ApplyStateMachine(std::shared_ptr<proto::Entry> entry) {
+    // uint64 nodeid = 1;    // 节点ID：哪个节点接到的客户端请求（用来过滤，只让该节点回复客户端）
+    // uint64 requestid = 2; // 请求ID：全局唯一，用于把"回复"和"当初的 RPC 请求"对上号
+    // methodType type = 3;  // 请求类型：Set/Get/Del
+    // string key = 4;       // 键
+    // string value = 5;     // 值
+    // string message = 6;   // 附带消息（如错误信息）
     proto::RaftEntryData entryData;
     entryData.ParseFromString(entry->data());
-    // 过滤：不是"接到请求的那个节点"，不回复（但数据照样执行了）
-    if (entryData.nodeid() != raft_->NodeId()) {
-        return;
-    }
 
-    // 取出当初登记的客户端请求（requestid 对号入座；加锁的 find + erase，保证原子）
+    // ★ 关键：把"要不要回复客户端"和"要不要执行状态机"分开！
+    //   - 只有"当初接到这个请求的节点"(is_origin) 才需要回复客户端；
+    //   - 但写操作(Set/Del) 必须在**所有**节点上执行，否则各副本 RocksDB 内容不一致。
+    //     Raft 的前提就是：每个节点执行相同的日志序列，得到相同的状态。
+    //   （原来这里是 nodeid 不匹配就直接 return，导致写只落在发起节点上）
+    const bool is_origin = (entryData.nodeid() == raft_->NodeId());
+
+    // 只有 origin 才能取到待回复登记（其它节点根本没有这条登记）
     RaftReply replyMeta;
-    if (!service_->TakePendingRequest(entryData.requestid(), replyMeta)) {
-        // 登记已不在（如节点重启后丢失），无法回复，放弃
-        return;
-    }
+    const bool need_reply =
+        is_origin && service_->TakePendingRequest(entryData.requestid(), replyMeta);
     
     // 特殊类型:读索引警告（appliedIndex 还没追上 readIndex，拒绝读）
-    if (entry->type() == proto::EntryType::EntryWarningReadIndex) {
+    // 只有发起读的节点会遇到（它一定有登记）
+    if (need_reply && entry->type() == proto::EntryType::EntryWarningReadIndex) {
         proto::GetResponse* response = static_cast<proto::GetResponse*>(replyMeta.response);
-        entryData.set_message(entry->message());
+        // entryData.set_message(entry->message());
+        response->set_message(entry->message());
+        response->set_value("");  // 读索引警告，没数据
         response->set_readindex(entry->index());
         replyMeta.done->Run();  // 回复客户端（带警告）
         return;
@@ -157,28 +167,32 @@ void StateMachine::ApplyStateMachine(std::shared_ptr<proto::Entry> entry) {
     // 开始应用状态机：按操作类型真正执行
     switch (entryData.type()) {
         case proto::methodType::SetOperation: {
-            // 写：key -> value 写入 RocksDB
-            proto::SetResponse* response = static_cast<proto::SetResponse*>(replyMeta.response);
-            bool resDB = db_->Set(entryData.key(), entryData.value());
-            response->set_message("ok");
+            // 写：★所有节点都必须执行★，保证各副本一致
+            db_->Set(entryData.key(), entryData.value());
+            if (need_reply) {
+                static_cast<proto::SetResponse*>(replyMeta.response)->set_message("ok");
+            }
             break;
         }
         case proto::methodType::DelOperation: {
-            // 删：删除 key
-            proto::DelResponse* response = static_cast<proto::DelResponse*>(replyMeta.response);
-            bool resDB = db_->Delete(entryData.key());
-            response->set_message("ok");
+            // 删：同上，所有节点都执行
+            db_->Delete(entryData.key());
+            if (need_reply) {
+                static_cast<proto::DelResponse*>(replyMeta.response)->set_message("ok");
+            }
             break;
         }
         case proto::methodType::GetOperation: {
-            // 读：从 DB 读出 value，回给客户端（带上日志索引作为 readIndex）
-            proto::GetResponse* response = static_cast<proto::GetResponse*>(replyMeta.response);
-            std::string key = entryData.key();
-            std::string value;
-            bool res = db_->Get(key, value);
-            response->set_value(value);
-            response->set_message(entryData.message());
-            response->set_readindex(entry->index());
+            // 读：读不改变状态，只有发起节点,需要真正读并回包;
+            if (need_reply) {
+                proto::GetResponse* response = static_cast<proto::GetResponse*>(replyMeta.response);
+                std::string key = entryData.key();
+                std::string value;
+                db_->Get(key, value);
+                response->set_value(value);
+                response->set_message(entryData.message());
+                response->set_readindex(entry->index());
+            }
             break;
         }
         default: {
@@ -186,8 +200,10 @@ void StateMachine::ApplyStateMachine(std::shared_ptr<proto::Entry> entry) {
         }
     }
 
-    // 回复客户端：执行 brpc 的 done 回调
-    LOG_INFO("回复客户端, 请求ID: %d", entryData.requestid());
-    replyMeta.done->Run();
+    // 回复客户端: 只有发起节点有登记，执行 brpc 的 done 回调;
+    if (need_reply) {
+        LOG_INFO("回复客户端, 请求ID: %d", entryData.requestid());
+        replyMeta.done->Run();
+    }
 }
 }  // namespace kv

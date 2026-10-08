@@ -24,6 +24,18 @@ ClientServiceImpl::ClientServiceImpl(RaftNode* raft, std::shared_ptr<KVEngine> d
             pendingTimeoutMs_ = v;
         }
     }
+
+    // 读一致性模式: 默认线性一致性读; 用 KV_READ_MODE=weak|readindex|strong 切换
+    readMode_ = kReadIndex;
+    if (const char* mode = std::getenv("KV_READ_MODE")) {
+        std::string m(mode);
+        if (m == "readindex" || m == "read_index") {
+            readMode_ = kReadIndex;
+        } else if (m == "strong") {
+            readMode_ = kStrongConsistency;
+        }
+        LOG_INFO("client read mode = %s", m.c_str());
+    }
     sweeper_ = std::thread([this] { SweepLoop(); });
 }
 
@@ -36,35 +48,38 @@ void ClientServiceImpl::Stop() {
     }
 }
 
-// 后台循环：每 500ms 检查一次有没有"挂了太久"的待回复请求
+// 后台循环: 每 500ms 检查一次有没有"挂了太久"的待回复请求
 void ClientServiceImpl::SweepLoop() {
     while (!stopSweeper_.load()) {
-        // 分 5 小段睡，便于收到 Stop 后能很快退出
+        // 分 5 小段睡，便于收到 Stop 后能很快退出;
         for (int i = 0; i < 5 && !stopSweeper_.load(); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
         if (stopSweeper_.load()) {
             break;
         }
 
-        std::vector<std::pair<uint32_t, RaftReply>> expired = TakeExpiredRequests();
+        std::vector<std::pair<uint64_t, RaftReply>> expired = TakeExpiredRequests();
         if (expired.empty()) {
             continue;
         }
+
         // 在锁外回复（避免持锁做网络 IO）
         for (auto& kv : expired) {
             ReplyError(kv.second, "request timeout (server overloaded)");
         }
-        LOG_WARN("expired %zu pending client requests (server busy or client gone)",
-                 expired.size());
+        LOG_WARN("expired %zu pending client requests (server busy or client gone)",expired.size());
     }
 }
 
 // 取出所有已超时的登记（加锁；取完即从表中删除，保证只有一个人能拿到）
-std::vector<std::pair<uint32_t, RaftReply>> ClientServiceImpl::TakeExpiredRequests() {
-    std::vector<std::pair<uint32_t, RaftReply>> out;
+std::vector<std::pair<uint64_t, RaftReply>> ClientServiceImpl::TakeExpiredRequests() {
+    std::vector<std::pair<uint64_t, RaftReply>> out;
     auto now = std::chrono::steady_clock::now();
+
     std::lock_guard<std::mutex> lock(pendingMutex_);
+
     for (auto it = pendingRequests_.begin(); it != pendingRequests_.end();) {
         if (now >= it->second.deadline) {
             out.emplace_back(it->first, it->second);
@@ -80,6 +95,9 @@ std::vector<std::pair<uint32_t, RaftReply>> ClientServiceImpl::TakeExpiredReques
 void ClientServiceImpl::ReplyError(RaftReply& reply, const std::string& msg) {
     if (reply.response != nullptr) {
         switch (reply.type) {
+            case proto::methodType::keysOperation:
+                static_cast<proto::SetResponse*>(reply.response)->set_message(msg);
+                break;
             case proto::methodType::SetOperation:
                 static_cast<proto::SetResponse*>(reply.response)->set_message(msg);
                 break;
@@ -110,22 +128,15 @@ void ClientServiceImpl::ReplyError(RaftReply& reply, const std::string& msg) {
 //   ReadIndex：先问 leader 要一个"安全水位"（commit 索引），
 //               等本地 appliedIndex 超过它再读（强一致且不用复制日志，
 //               本项目的推荐做法）
-// 本项目编译时固定走 WeakConsistency（case 直接写死），
-// 所以客户端读的是"弱一致"数据；想看其他模式改这里即可。
+// 具体走哪种由环境变量 KV_READ_MODE 决定（weak/readindex/strong），默认弱读。
 // ============================================================================
 void ClientServiceImpl::Get(::google::protobuf::RpcController* controller,
                             const ::proto::GetRequest* request,
                             ::proto::GetResponse* response,
                             ::google::protobuf::Closure* done) {
-    
-    enum LinearConsistency {
-        StrongConsistency,  // 最原始的强一致性
-        WeakConsistency,    // 弱一致性的 FollowerRead
-        ReadIndex           // 强一致性的 FollowerRead
-    };
 
     // 生成请求号（回包时靠它找到这份登记）
-    uint32_t requestId = NextRequestId();
+    uint64_t requestId = NextRequestId();
     // 封装请求数据
     proto::RaftEntryData entryData;
     entryData.set_nodeid(raft_->NodeId());  // 记录是哪个节点接的请求
@@ -148,24 +159,22 @@ void ClientServiceImpl::Get(::google::protobuf::RpcController* controller,
     // 记录"待回复请求"（等共识完成后来回复）
     AddPendingRequest(requestId, replyMeta);
 
-    // 注意：本项目当前固定走 WeakConsistency（弱读）
-    switch (LinearConsistency::WeakConsistency) {
-        case StrongConsistency: {
-            // 走 Raft 共识（像写操作一样复制日志）
+    // 按 KV_READ_MODE 选择读一致性模式（默认弱读）
+    switch (readMode_) {
+        case kStrongConsistency: {
+            // 读也走 Raft 共识（像写一样复制一条日志，最强但最慢）
             raft_->ProcessProposal(data);
         } break;
-        case WeakConsistency: {
-            // 弱读：直接在本地 DB 上读，不经过 Raft
-            // （ReadIndex 里用 AppliedStateMachine 直接执行读，见 raft_node.cpp）
-            raft_->ProcessWeakRead(data);
-        } break;
-        case ReadIndex: {
-            // 线性一致读：先取安全水位再读
+        case kReadIndex: {
+            // 线性一致读（ReadIndex）: 先向 leader 取一个"安全水位"，
+            // 等本地 appliedIndex 追上再读本地 DB
             raft_->ProcessReadIndex(data);
         } break;
-        default:
-            LOG_INFO("unkown type");
-            break;
+        case kWeakConsistency:
+        default: {
+            // 弱读: 直接在本地 DB 上读，不经过 Raft（可能读到旧数据）
+            raft_->ProcessWeakRead(data);
+        } break;
     }
 }
 
@@ -174,10 +183,10 @@ void ClientServiceImpl::Set(::google::protobuf::RpcController* controller,
                             const ::proto::SetRequest* request,
                             ::proto::SetResponse* response,
                             ::google::protobuf::Closure* done) {
-    uint32_t requestId = NextRequestId();
+    uint64_t requestId = NextRequestId();
     /*
     message RaftEntryData {
-    uint64 nodeid = 1;    // 节点ID：哪个节点收到的客户端请求(用来过滤，只让该节点回复客户端)
+    uint64 nodeid = 1;    // 节点ID：哪个节点收到的客户端请求(用来过滤, 只让该节点回复客户端)
     uint64 requestid = 2; // 请求ID：全局唯一，用于把"回复"和"当初的 RPC 请求"对上号
     methodType type = 3;  // 请求类型：Set/Get/Del
     string key = 4;       // 键
@@ -220,7 +229,7 @@ void ClientServiceImpl::Del(::google::protobuf::RpcController* controller,
                             const ::proto::DelRequest* request,
                             ::proto::DelResponse* response,
                             ::google::protobuf::Closure* done) {
-    uint32_t requestId = NextRequestId();
+    uint64_t requestId = NextRequestId();
     proto::RaftEntryData entryData;
     entryData.set_nodeid(raft_->NodeId());
     entryData.set_requestid(requestId);

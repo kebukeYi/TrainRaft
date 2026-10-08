@@ -5,8 +5,10 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace kv {
@@ -157,7 +159,13 @@ class RaftNodeImpl : public RaftNode {
         conf.preVote = true;
 
         // 只读请求用安全模式（ReadIndex）or ReadOnlyLeaseBased
+        // 默认安全模式(ReadIndexSafe)；可用环境变量 KV_READ_ONLY_OPTION=lease 切到租约模式
         conf.readOnlyOption = ReadOnlySafe;
+        if (const char* ro = std::getenv("KV_READ_ONLY_OPTION")) {
+            if (std::string(ro) == "lease") {
+                conf.readOnlyOption = ReadOnlyLeaseBased;
+            }
+        }
         conf.disableProposalForwarding = false;
         conf.clusterInfo = peers_;
 
@@ -432,7 +440,7 @@ class RaftNodeImpl : public RaftNode {
     }
 
     // ------------------------------------------------------------------
-    // ProcessMessage：收到其他节点发来的 raft 消息
+    // ProcessMessage: 收到其他节点发来的 raft 消息, 不走日志;
     // 如果不在 raft 线程上，投递到 raft 线程（ioService_）执行；
     // 否则直接执行。执行后处理 Ready
     // ------------------------------------------------------------------
@@ -452,10 +460,11 @@ class RaftNodeImpl : public RaftNode {
         }
     }
 
-    // 处理写提案（客户端 Set/Del）：攒批 + 组提交
+    // 处理写提案（客户端 Set/Del）: 攒批 + 组提交
     // 不在 raft 线程时先把请求塞进 pendingProposals_（只排一个 flush 任务），
     // 由 FlushProposals 在 raft 线程上一次性把整批 Propose 出去。
     void ProcessProposal(std::shared_ptr<std::vector<uint8_t>> data) {
+        // 大概率不在 raft 线程上（客户端请求是多线程的），所以攒批处理;
         if (pthreadId_ != pthread_self()) {
             bool need_post = false;
             {
@@ -470,8 +479,9 @@ class RaftNodeImpl : public RaftNode {
                 ioService_.post([this]() { FlushProposals(); });
             }
         } else {
-            // 已经在 raft 线程：直接提案并处理（不攒批）
+            // 已经在 raft 线程: 直接提案并处理（不攒批）
             Status status = node_->Propose(data);
+            // 
             PullReadyEvents();
         }
     }
@@ -534,7 +544,7 @@ class RaftNodeImpl : public RaftNode {
         for (auto& data : batch) {
             node_->Propose(data);
         }
-        // 一次 PullReadyEvents：Ready 里带上这一批的全部 entries，
+        // 一次 PullReadyEvents: Ready 里带上这一批的全部 entries,
         // wal_->Save() 因此只做一次 fsync
         PullReadyEvents();
     }
@@ -573,7 +583,7 @@ class RaftNodeImpl : public RaftNode {
 
         // 循环处理: raft 可能连续产生多个 Ready
         while (node_->HasReady()) {
-            // 获取 Ready（包含硬状态/新日志/快照/消息/已提交日志/读结果）
+            // 获取 Ready(包含硬状态/新日志/快照/消息/已提交日志/读结果)
             auto rd = node_->GetReady();
 
             // 判断是否 发生了 Ready 事件(有新日志/快照/消息/已提交日志/读结果)

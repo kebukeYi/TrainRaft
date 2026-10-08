@@ -18,6 +18,13 @@ RaftNodeImpl{构造函数}.Main(): 初始化各种索引, 状态, 快照;配置�
 Raft -> Nodelmpl ->  RaftNodelmpl
 ----------------------------------------------------------------------
 
+待优化点
+
+1.流水线（pipeline）：不等上一轮结果就发下一批（现在组提交已经是雏形）
+2.减少一轮往返：让 commit 通知搭在下一批 MsgApp 上，而不是每次都单独 BcastAppend；
+3.查一下节点间往返为什么 ~8ms（brpc 线程/定时器配置、容器网络），这是当前最大的一块；
+4.批量落盘 + RocksDB WriteBatch（apply 时一次写多条，而不是每条一次 db_->Put）；
+5.租约读（ReadOnlyLeaseBased）：省掉 ReadIndex 的确认往返（有时钟漂移风险）
 
 
 

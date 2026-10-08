@@ -36,8 +36,7 @@ void ZkClient::Start() {
     - 网络 I/O 线程（负责收发）
     - watcher 回调线程（负责执行回调函数）
     */
-    zooHandle_ = zookeeper_init("127.0.0.1:2181", GlobalWatcher, 30000, nullptr,
-                                nullptr, 0);
+    zooHandle_ = zookeeper_init("127.0.0.1:2181", GlobalWatcher, 30000, nullptr, nullptr, 0);
     if (nullptr == zooHandle_) {
         LOG_ERROR("zookeeper_init error!");
         exit(EXIT_FAILURE);

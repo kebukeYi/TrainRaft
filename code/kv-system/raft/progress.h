@@ -155,7 +155,7 @@ class Progress {
 
     // inflights_：在途消息滑动窗口（见 InFlight 注释）。
     // 发 MsgApp 时把最后一条日志的索引 Add 进去，收到回复时 FreeTo 释放。
-    // 索引必须按顺序添加
+    // 索引必须按顺序添加;
     std::shared_ptr<InFlight> inflights_;
 };
 

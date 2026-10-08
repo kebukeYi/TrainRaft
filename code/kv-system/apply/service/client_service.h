@@ -33,11 +33,20 @@ class RaftNode;  // 前置声明
 // 等这条日志被提交应用后，再拿着 requestid 找到它，执行 done->Run() 回复
 struct RaftReply {
     google::protobuf::Closure* done = nullptr;  // brpc 的完成回调（调用即回复）
-    void* response = nullptr;                   // 指向 RPC 响应对象（SetResponse 等）
-    // 请求类型：超时清理时要按类型把错误写进对应的 Response（Set/Del/Get 都有 message 字段）
+    void* response = nullptr;  // 指向 RPC 响应对象（SetResponse 等）
+    // 请求类型: 超时清理时要按类型把错误写进对应的 Response（Set/Del/Get 都有
+    // message 字段）
     proto::methodType type = proto::methodType::PingOperation;
-    // 超时时刻 = 登记时间 + pendingTimeoutMs_；超过它还没被应用就由 sweeper 清理
+    // 超时时刻 = 登记时间 + pendingTimeoutMs_；超过它还没被应用就由 sweeper
+    // 清理
     std::chrono::steady_clock::time_point deadline;
+};
+
+// 三种读一致性模式（用环境变量 KV_READ_MODE 选择：weak / readindex / strong）
+enum ReadConsistency {
+    kStrongConsistency = 0,  // 读也当成"写"走一遍 Raft 共识：最强、最慢;
+    kWeakConsistency = 1,    // 弱读：直接读本地 DB，最快但可能读到旧数据;
+    kReadIndex = 2,  // ReadIndex：先取"安全水位"再读，强一致且不复制日志;
 };
 
 // ============================================================================
@@ -61,9 +70,13 @@ class ClientServiceImpl : public ClientService {
    private:
     RaftNode* raft_;                // 门面（提交请求/读请求）
     std::shared_ptr<KVEngine> db_;  // 本地 KV 引擎（弱读/Keys 直接查）
+    // 读一致性模式（见上面的 ReadConsistency），由环境变量 KV_READ_MODE 决定
+    int readMode_;
+
     // 请求号发生器：会被多个 brpc 工作线程并发调用，必须用原子类型，
     // 否则并发自增会产生重复的 requestid，导致 pendingRequests_ 互相覆盖
-    std::atomic<uint32_t> nextRequestId_;
+    std::atomic<uint64_t> nextRequestId_;
+
     // 保护 pendingRequests_ 的互斥锁：
     // 这张表会被 brpc 工作线程（Set/Get/Del 里登记）、
     // raft 线程（ApplyStateMachine 里取出）和 sweeper 线程并发访问
@@ -77,7 +90,7 @@ class ClientServiceImpl : public ClientService {
    public:
     // requestid -> 待回复的请求登记（上面 RaftReply 注释）。
     // 注意：不要直接操作它，统一走下面的 AddPendingRequest / TakePendingRequest
-    std::unordered_map<uint32_t, RaftReply> pendingRequests_;
+    std::unordered_map<uint64_t, RaftReply> pendingRequests_;
 
    public:
     ClientServiceImpl(RaftNode* raft, std::shared_ptr<KVEngine> db);
@@ -87,10 +100,12 @@ class ClientServiceImpl : public ClientService {
     void Stop();
 
     // 原子地生成一个请求号
-    uint32_t NextRequestId() { return nextRequestId_++; }
+    uint64_t NextRequestId() { 
+        return nextRequestId_.fetch_add(1); 
+    }
 
     // 登记一条"待回复的客户端请求"（自带加锁，并打上超时时刻）
-    void AddPendingRequest(uint32_t id, RaftReply reply) {
+    void AddPendingRequest(uint64_t id, RaftReply reply) {
         reply.deadline = std::chrono::steady_clock::now() +
                          std::chrono::milliseconds(pendingTimeoutMs_);
         std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -99,7 +114,7 @@ class ClientServiceImpl : public ClientService {
 
     // 取出并删除一条待回复请求（加锁，find + erase 一次完成，保证原子性）。
     // 返回 false 表示没有对应登记（如已被处理过 / 已超时清理）
-    bool TakePendingRequest(uint32_t id, RaftReply& out) {
+    bool TakePendingRequest(uint64_t id, RaftReply& out) {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         auto it = pendingRequests_.find(id);
         if (it == pendingRequests_.end()) {
@@ -137,7 +152,7 @@ class ClientServiceImpl : public ClientService {
     void SweepLoop();
 
     // 取出所有已超时的登记（加锁，取完即删）
-    std::vector<std::pair<uint32_t, RaftReply>> TakeExpiredRequests();
+    std::vector<std::pair<uint64_t, RaftReply>> TakeExpiredRequests();
 
     // 按请求类型，把错误信息写进对应的 Response，然后回复客户端
     static void ReplyError(RaftReply& reply, const std::string& msg);

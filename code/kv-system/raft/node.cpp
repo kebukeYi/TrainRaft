@@ -125,6 +125,7 @@ class NodeImpl : public Node {
     // 提议写日志：把数据包成 MsgProp 消息喂给 raft
     Status Propose(std::shared_ptr<std::vector<uint8_t>> data) final {
         std::shared_ptr<proto::Message> msg(new proto::Message());
+        // 把 msg 设置成 MsgProp 类型;
         msg->set_type(proto::MessageType::MsgProp);
         msg->set_from(raft_->id_);
         auto* entry = msg->add_entries();
@@ -132,6 +133,7 @@ class NodeImpl : public Node {
         entry->set_term(0);
         entry->set_index(0);
         entry->set_data(std::string(data->begin(), data->end()));
+        
         // 核心算法: 把消息喂给 raft 状态机（交给当前角色对应的 step_ 函数处理）;
         return raft_->Step(std::move(msg));
     }
