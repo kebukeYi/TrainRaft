@@ -567,6 +567,7 @@ class RaftNodeImpl : public RaftNode {
 
             // ④ 发送消息给其他节点（投票/追加日志/心跳…）
             if (!rd->messages.empty()) {
+                // 异步发送：Send 内部走 brpc 异步回调，不会阻塞本（raft）线程
                 transport_->Send(rd->messages);
             }
 

@@ -160,10 +160,9 @@ bool IsResponseMsg(std::shared_ptr<proto::Message> msg) {
 
 // mustSync：是否需要"同步刷盘"（fsync）才能安全返回。
 // Raft 论文要求：term、votedFor、日志条目在回复 RPC 前必须落盘。
-// 所以只要这次有新的日志条目、或者投票/任期变了，就必须强制 fsync；
+// 所以只要这次有新的日志条目、或者投票/任期变了，就必须强制 fsync;
 // 只有"纯提交索引变化"这类情况才允许异步写（性能优化）
-bool IsMustSync(const proto::HardState& st, const proto::HardState& prevst,
-                size_t entsnum) {
+bool IsMustSync(const proto::HardState& st, const proto::HardState& prevst,size_t entsnum) {
     return entsnum != 0 || st.vote() != prevst.vote() ||
            st.term() != prevst.term();
 }

@@ -12,6 +12,45 @@
 using namespace proto;
 
 namespace kv {
+
+// ----------------------------------------------------------------------------
+// SendDone：异步发送完成后的回调（brpc 保证每条 RPC 的回调恰好被调用一次）
+//
+// 为什么改成异步：Send() 是在 raft 线程（ioService_ 事件循环）上被调用的。
+// 若同步发送，每条消息都要阻塞等对端回包，raft 线程就被网络 IO 卡住，
+// 心跳 / 选举 / 日志应用全被拖延。改成异步后 Send() 立即返回。
+//
+// 代价：controller / request / response 不能在栈上（函数返回即析构），
+// 必须堆分配、在回调里释放；channel 也一并持有，保证调用期间连接不被销毁。
+// ----------------------------------------------------------------------------
+namespace {
+struct SendDone : public google::protobuf::Closure {
+    SendDone(brpc::Controller* c, TransportRequest* req,
+             TransportResponse* resp, std::shared_ptr<brpc::Channel> ch,
+             proto::MessageType t, uint64_t to_)
+        : cntl(c), request(req), response(resp), channel(std::move(ch)),
+          type(t), to(to_) {}
+
+    void Run() override {
+        if (cntl->Failed()) {
+            LOG_WARN("send message(type=%d) to peer %lu failed: %s", type, to,
+                     cntl->ErrorText().c_str());
+        }
+        delete cntl;
+        delete request;
+        delete response;
+        delete this;  // 回调只执行一次，安全自毁
+    }
+
+    brpc::Controller* cntl;
+    TransportRequest* request;
+    TransportResponse* response;
+    std::shared_ptr<brpc::Channel> channel;  // 让 channel 活到本次调用结束
+    proto::MessageType type;
+    uint64_t to;
+};
+}  // namespace
+
 // ============================================================================
 // TransportImpl：Transport 接口的具体实现（基于 brpc）
 //
@@ -83,39 +122,37 @@ class TransportImpl : public Transport {
         rpcClients_[id] = rpcClient;
     }
 
-    // 发送一批消息: 按每条消息的 to 字段找对应的 channel 发出去
+    // 发送一批消息: 按每条消息的 to 字段找对应的 channel 发出去。
+    // 异步发送: done 非空 → brpc 立即返回，不阻塞 raft 线程；
+    // 回包/失败时在 brpc 线程执行 SendDone::Run() 释放资源。
     void Send(std::vector<std::shared_ptr<proto::Message>> msgs) final {
         for (auto& msg : msgs) {
             if (msg->to() == 0) {
                 // to 为 0 表示"故意丢弃的消息"，跳过
                 continue;
             }
-            auto it = rpcClients_.find(msg->to());
-            if (it == rpcClients_.end()) {
-                // 目标不在连接表里（可能被移除了），忽略
-                LOG_DEBUG(
-                    "ignored message %d (sent to unknown peer "
-                    "%lu)",
-                    msg->type(), msg->to());
-                continue;
+            // 只在查表时加锁，拿到 channel 的 shared_ptr 后立刻放锁
+            std::shared_ptr<brpc::Channel> channel;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                auto it = rpcClients_.find(msg->to());
+                if (it == rpcClients_.end()) {
+                    // 目标不在连接表里（可能被移除了），忽略
+                    LOG_DEBUG("ignored message %d (sent to unknown peer %lu)",
+                              msg->type(), msg->to());
+                    continue;
+                }
+                channel = it->second;
             }
-            // 通过 brpc 调对端节点的 MessageChannel 接口。
-            // done 传 nullptr = 同步调用（阻塞到对端返回），所以
-            // request/response/controller 都可以放在栈上，函数返回时自动析构。
-            // （原来的写法是 new Controller/new Response 且从不 delete, 每发一条消息就泄漏一块内存）
-            TransportService_Stub stub(it->second.get());
-            TransportRequest request; // 原来: new TransportRequest()
-            TransportResponse response; // 原来: new TransportResponse()
-            brpc::Controller cntl; // 原来: new brpc::Controller()
-            request.mutable_msg()->CopyFrom(*msg);
 
-            stub.MessageChannel(&cntl, &request, &response, nullptr);
-
-            // 发送失败（对端挂了/网络断）时打条日志，方便排查问题
-            if (cntl.Failed()) {
-                LOG_WARN("send message(type=%d) to peer %lu failed: %s",
-                         msg->type(), msg->to(), cntl.ErrorText().c_str());
-            }
+            // 异步调用: 参数必须堆分配（要活到回调执行），由 SendDone 负责释放
+            TransportService_Stub stub(channel.get());
+            auto* cntl = new brpc::Controller();
+            auto* request = new TransportRequest();
+            auto* response = new TransportResponse();
+            request->mutable_msg()->CopyFrom(*msg);
+            auto* done = new SendDone(cntl, request, response, channel, msg->type(), msg->to());
+            stub.MessageChannel(cntl, request, response, done);
         }
     }
 
