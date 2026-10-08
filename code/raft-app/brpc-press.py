@@ -125,28 +125,43 @@ def parse_args():
     )
     p.add_argument("-m", "--method", choices=sorted(METHODS), default="set",
                    help="压测的方法：set(写)/get(读)/del(删)")
-    p.add_argument("-q", "--qps", type=int, default=1000,
-                   help="每秒请求数；0 表示不限速（最大压力）")
+
+    p.add_argument("-q", "--qps", type=int, default=100,
+                   help="每秒请求数；0 = 不限速。注意：写请求每条都要 fsync，"
+                        "本机吞吐只有几十条/秒，QPS 设太大只会超时")
+
     p.add_argument("-d", "--duration", type=int, default=10,
                    help="持续压测的秒数")
+
     p.add_argument("-t", "--target", choices=["leader", "follower"], default="leader",
                    help="压 leader 还是某个 follower（follower 场景可测转发路径）")
+
     p.add_argument("--threads", type=int, default=8,
                    help="rpc_press 发送线程数（0=自动）")
-    p.add_argument("--connection-type", default="pooled",
+
+    p.add_argument("--connection-type", default="single",
                    choices=["single", "pooled", "short"],
-                   help="连接方式：single 单连接 / pooled 连接池 / short 短连接")
-    p.add_argument("--timeout-ms", type=int, default=3000,
-                   help="单次 RPC 超时（毫秒）")
+                   help="连接方式：single 单连接(推荐, FD 占用小且稳定) / "
+                        "pooled 连接池(高并发时会开大量连接, 容易耗尽 FD) / short 短连接")
+
+    p.add_argument("--timeout-ms", type=int, default=10000,
+                   help="单次 RPC 超时（毫秒）；写请求较慢，别设太小")
+
     p.add_argument("--max-retry", type=int, default=3,
                    help="失败重试次数")
+
     p.add_argument("--key", default="name", help="请求用的 key")
+
     p.add_argument("--value", default="ft", help="请求用的 value（仅 set 用）")
+
     p.add_argument("--proto", default=DEFAULT_PROTO,
                    help="cli.proto 的路径")
+
     p.add_argument("--zk", default=ZK_HOSTS, help="ZooKeeper 地址")
+
     p.add_argument("--dummy-port", type=int, default=8888,
                    help="rpc_press dummy server 端口")
+                   
     return p.parse_args()
 
 
@@ -222,6 +237,15 @@ def main() -> int:
     print(f"[信息] rpc_press 退出码 = {result.returncode}")
     return result.returncode
 
+# 在容器里运行
+# docker exec -it distributed bash
+# cd /cxx_project/dkv/code/raft-app
+
+# python3 brpc-press.py                                   # 默认: 写 leader, 1000 QPS, 10 秒
+# python3 brpc-press.py -m set -q 2000 -d 20              # 写, 2000 QPS, 20 秒
+# python3 brpc-press.py -m get -q 500  -d 10 -t follower  # 读, 压 follower
+# python3 brpc-press.py -m set -q 0    -d 15              # 不限速, 打满 15 秒
+# python3 brpc-press.py -h                                # 查看全部参数
 
 if __name__ == "__main__":
     sys.exit(main())

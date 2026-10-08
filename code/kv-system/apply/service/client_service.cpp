@@ -1,6 +1,105 @@
 #include "service/client_service.h"
 
+#include <chrono>
+#include <cstdlib>
+
 namespace kv {
+
+// ============================================================================
+// 构造 / 析构 / 后台超时清理线程
+//
+// 为什么要它：客户端请求登记进 pendingRequests_ 后，本应由"日志被应用"时回复；
+// 但如果服务端过载（请求一直排不上号）或客户端已经断开，这份登记就会永远挂着，
+// brpc 会认为这条 RPC 还没结束、一直占着连接不放（CLOSE_WAIT），
+// 连接越堆越多，最后把文件描述符(FD)耗尽。
+// sweeper_ 负责定期回收这些"僵尸登记"：回一个错误、让 brpc 结束 RPC。
+// ============================================================================
+ClientServiceImpl::ClientServiceImpl(RaftNode* raft, std::shared_ptr<KVEngine> db)
+    : raft_(raft), db_(db), nextRequestId_(0), stopSweeper_(false) {
+    // 默认 10 秒；测试时可用环境变量覆盖，例如 KV_PENDING_TIMEOUT_MS=3000
+    pendingTimeoutMs_ = 10000;
+    if (const char* env = std::getenv("KV_PENDING_TIMEOUT_MS")) {
+        unsigned long long v = std::strtoull(env, nullptr, 10);
+        if (v > 0) {
+            pendingTimeoutMs_ = v;
+        }
+    }
+    sweeper_ = std::thread([this] { SweepLoop(); });
+}
+
+ClientServiceImpl::~ClientServiceImpl() { Stop(); }
+
+void ClientServiceImpl::Stop() {
+    stopSweeper_.store(true);
+    if (sweeper_.joinable()) {
+        sweeper_.join();
+    }
+}
+
+// 后台循环：每 500ms 检查一次有没有"挂了太久"的待回复请求
+void ClientServiceImpl::SweepLoop() {
+    while (!stopSweeper_.load()) {
+        // 分 5 小段睡，便于收到 Stop 后能很快退出
+        for (int i = 0; i < 5 && !stopSweeper_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (stopSweeper_.load()) {
+            break;
+        }
+
+        std::vector<std::pair<uint32_t, RaftReply>> expired = TakeExpiredRequests();
+        if (expired.empty()) {
+            continue;
+        }
+        // 在锁外回复（避免持锁做网络 IO）
+        for (auto& kv : expired) {
+            ReplyError(kv.second, "request timeout (server overloaded)");
+        }
+        LOG_WARN("expired %zu pending client requests (server busy or client gone)",
+                 expired.size());
+    }
+}
+
+// 取出所有已超时的登记（加锁；取完即从表中删除，保证只有一个人能拿到）
+std::vector<std::pair<uint32_t, RaftReply>> ClientServiceImpl::TakeExpiredRequests() {
+    std::vector<std::pair<uint32_t, RaftReply>> out;
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    for (auto it = pendingRequests_.begin(); it != pendingRequests_.end();) {
+        if (now >= it->second.deadline) {
+            out.emplace_back(it->first, it->second);
+            it = pendingRequests_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return out;
+}
+
+// 按请求类型把错误写进对应的 Response，然后回复客户端
+void ClientServiceImpl::ReplyError(RaftReply& reply, const std::string& msg) {
+    if (reply.response != nullptr) {
+        switch (reply.type) {
+            case proto::methodType::SetOperation:
+                static_cast<proto::SetResponse*>(reply.response)->set_message(msg);
+                break;
+            case proto::methodType::DelOperation:
+                static_cast<proto::DelResponse*>(reply.response)->set_message(msg);
+                break;
+            case proto::methodType::GetOperation:
+                static_cast<proto::GetResponse*>(reply.response)->set_message(msg);
+                break;
+            default:
+                break;
+        }
+    }
+    if (reply.done != nullptr) {
+        // 线程安全：这条登记已被 TakeExpiredRequests 从表中摘除，
+        // 不会和 ApplyStateMachine 那边重复回复（两边都是"取走才回复"）
+        reply.done->Run();
+    }
+}
+
 // ============================================================================
 // 客户端读接口 Get
 //
@@ -44,6 +143,7 @@ void ClientServiceImpl::Get(::google::protobuf::RpcController* controller,
     RaftReply replyMeta;
     replyMeta.done = done;
     replyMeta.response = static_cast<void*>(response);
+    replyMeta.type = proto::methodType::GetOperation;  // 超时清理时按类型回错误
 
     // 记录"待回复请求"（等共识完成后来回复）
     AddPendingRequest(requestId, replyMeta);
@@ -104,6 +204,7 @@ void ClientServiceImpl::Set(::google::protobuf::RpcController* controller,
     RaftReply replyMeta;
     replyMeta.done = done;
     replyMeta.response = static_cast<void*>(response);
+    replyMeta.type = proto::methodType::SetOperation;  // 超时清理时按类型回错误
 
     // ⭐ 必须先登记"待回复请求"，再把提案发出去！
     // 否则日志可能抢先提交并应用，ApplyStateMachine 找不到登记 → 客户端永远收不到回复
@@ -134,6 +235,7 @@ void ClientServiceImpl::Del(::google::protobuf::RpcController* controller,
     RaftReply replyMeta;
     replyMeta.done = done;
     replyMeta.response = static_cast<void*>(response);
+    replyMeta.type = proto::methodType::DelOperation;  // 超时清理时按类型回错误
 
     // ⭐ 必须先登记"待回复请求"，再把提案发出去（同 Set）
     AddPendingRequest(requestId, replyMeta);

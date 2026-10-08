@@ -34,7 +34,10 @@ StateMachine::StateMachine(RaftNode* raft, std::vector<uint8_t> snap, std::strin
 }
 
 StateMachine::~StateMachine() {
-    // 释放 keep-alive 并停止事件循环，否则工作线程会一直阻塞在 run() 上
+    // 先停掉客户端服务的超时清理线程，再停事件循环、等工作线程退出
+    if (service_ != nullptr) {
+        service_->Stop();
+    }
     work_.reset();
     ioService_.stop();
     if (worker_.joinable()) {
@@ -53,6 +56,9 @@ void StateMachine::Start(std::promise<pthread_t>& promise) {
 }
 
 void StateMachine::Stop() {
+    if (service_ != nullptr) {
+        service_->Stop();  // 停掉待回复请求的超时清理线程
+    }
     work_.reset();  // 松开 keep-alive，run() 才能返回
     ioService_.stop();
     if (worker_.joinable()) {
