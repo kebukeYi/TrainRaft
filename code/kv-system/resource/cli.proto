@@ -1,0 +1,99 @@
+syntax="proto3";
+
+package proto;
+
+option cc_generic_services = true;
+// option optimize_for = LITE_RUNTIME;
+
+// ============================================================================
+// cli.proto：客户端和 KV 服务端之间的 RPC 接口定义
+//
+// 大白话：客户端想"存一个 key、读一个 key、删一个 key"，就通过 brpc
+// 调这里的 Set/Get/Del 等接口。服务端把请求转成一条 Raft 日志（RaftEntryData），
+// 交给 Raft 集群达成一致后真正落库，再通过 pendingRequests_ 找到当初那个
+// RPC 请求回复客户端。所以本文件定义了两类东西：
+//   1. 客户端能看到的外部接口（Set/Get/Del/Keys/Ping）
+//   2. 内部使用的"请求包"格式 RaftEntryData（客户端请求被序列化后
+//      作为一条 Raft 日志的内容复制到所有节点上）
+// ============================================================================
+
+// 操作类型：区分这条日志是"写 key / 读 key / 删 key"
+enum methodType {
+    PingOperation = 0;   // 心跳测试
+    SetOperation = 1;    // 写
+    GetOperation = 2;    // 读
+    DelOperation = 3;    // 删
+    keysOperation = 4;   // 列出所有 key
+}
+/* Set：写请求 */
+message SetRequest{
+    string key = 1;    // 键
+    string value = 2;  // 值
+}
+message SetResponse{
+    string message = 1;  // 返回信息，成功就是 "ok"
+}
+
+/* Get：读请求 */
+message GetRequest{
+    string key = 1;  // 键
+}
+message GetResponse{
+    string message = 1;   // 返回信息
+    string value = 2;     // 读到的值
+    uint32 readIndex = 3; // 这次读对应的 Raft 日志索引（线性一致读用）
+}
+
+/* Del：删除请求 */
+message DelRequest{
+    string key = 1;  // 键
+}
+message DelResponse{
+    string message = 1;
+}
+
+/* Keys：列出所有 key */
+message KeysRequest{
+    string key = 1;   // 键
+    string value = 2; // 值
+}
+message KeysResponse{
+    string message = 1;
+}
+
+/* Ping：连通性测试 */
+message PingRequest{
+    string message = 1;
+}
+message PingResponse{
+    string message = 1;
+}
+
+// ----------------------------------------------------------------------------
+// RaftEntryData：客户端请求"进入 Raft 日志"时的载体
+//
+// 大白话：客户端调 Set("name","zhangsan") 到达任意一个节点后，节点把这个
+// 请求封装成 RaftEntryData（是谁的请求、请求 id、什么操作、key、value），
+// 序列化成一段字节，作为一条 Raft 日志的内容（Entry.data）交给 Raft 复制。
+// Raft 保证这条日志在多数节点上都写入后，各节点再把它解析出来真正执行，
+// 从而保证所有节点上的 KV 数据一致。
+// ----------------------------------------------------------------------------
+message RaftEntryData {
+    uint64 nodeid = 1;    // 节点ID：哪个节点接到的客户端请求（用来过滤，只让该节点回复客户端）
+    uint64 requestid = 2; // 请求ID：全局唯一，用于把"回复"和"当初的 RPC 请求"对上号
+    methodType type = 3;  // 请求类型：Set/Get/Del
+    string key = 4;       // 键
+    string value = 5;     // 值
+    string message = 6;   // 附带消息（如错误信息）
+}
+
+// ----------------------------------------------------------------------------
+// 对外暴露的 RPC 服务：客户端连接节点时用的接口
+// ----------------------------------------------------------------------------
+service ClientService{
+    rpc Ping(PingRequest) returns (PingResponse);   // 探活
+    rpc Set(SetRequest) returns (SetResponse);      // 写
+    rpc Get(GetRequest) returns (GetResponse);      // 读
+    rpc Del(DelRequest) returns (DelResponse);      // 删
+    rpc Keys(KeysRequest) returns (KeysResponse);   // 列出所有 key
+}

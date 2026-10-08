@@ -1,0 +1,7 @@
+# valgrind --leak-check=full --track-origins=yes
+
+zookeeper: bash -c '/opt/apache-zookeeper-3.8.6-bin/bin/zkServer.sh status > /dev/null 2>&1 && echo "ZooKeeper is running." || (echo "ZooKeeper is not running, let''s start it"; /opt/apache-zookeeper-3.8.6-bin/bin/zkServer.sh start; sleep 3)'
+
+node1: bash -c 'sleep 3; LD_PRELOAD=/usr/lib/libprofiler.so CPUPROFILE=raft-kv-1.prof ./raft-app/raft-kv --id 1 --configFile=kv-system-config.json'
+node2: bash -c 'sleep 3; LD_PRELOAD=/usr/lib/libprofiler.so CPUPROFILE=raft-kv-2.prof ./raft-app/raft-kv --id 2 --configFile=kv-system-config.json'
+node3: bash -c 'sleep 3; LD_PRELOAD=/usr/lib/libprofiler.so CPUPROFILE=raft-kv-3.prof ./raft-app/raft-kv --id 3 --configFile=kv-system-config.json'

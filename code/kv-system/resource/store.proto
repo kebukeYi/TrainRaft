@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package proto;
+
+// ============================================================================
+// store.proto：和"存储/快照"相关的消息定义
+//
+// 大白话：Raft 集群中的日志会无限增长，所以每隔一段时间（比如应用了 10 万条
+// 日志后）leader 会把当前整个 KV 状态做成一个"快照"，然后就能把旧的日志删掉。
+// 快照 = 某一时刻 KV 库的全部数据 + 当时的元信息（日志到哪了、集群有哪些节点）。
+// 本文件定义的就是快照的格式，以及 WAL 里记录快照位置用的 WALsnapshot。
+// ============================================================================
+
+/* WAL 里记录"快照做到哪个日志位置了"。
+   作用：重启时先看快照文件，再根据这个 index 决定从哪个 WAL 文件开始恢复 */
+message WALsnapshot {
+  uint64 index = 1;  // 快照对应的日志索引（日志第几条）
+  uint64 term = 2;   // 快照对应的任期
+}
+
+/* 快照 */
+// ConfState：集群"配置状态"，就是当前集群里有哪几个节点（节点 id 列表）
+message ConfState { repeated uint64 nodes = 1; }
+
+// 快照发送给 follower 之后的反馈状态
+enum SnapshotStatus {
+  SnapshotFinish = 0;  // 快照完成
+  SnapshotFailure = 1; // 快照失败
+}
+
+// 快照的元信息：记录这个快照是"日志第几条、第几个任期"时刻的，
+// 以及当时的集群成员是谁
+message SnapshotMetadata {
+  ConfState confState = 1;  // 做快照那一刻的集群成员列表
+  uint64 index = 2;         // 快照覆盖到的最后一条日志索引
+  uint64 term = 3;          // 那条日志所在的任期
+}
+
+// 一个完整的快照：
+// data = KV 数据的序列化内容（用 msgpack 打包的 key-value 表）
+// metadata = 上面的元信息
+message Snapshot {
+  bytes data = 1;
+  SnapshotMetadata metadata = 2;
+}

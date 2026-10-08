@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package proto;
+
+import "store.proto";
+
+option cc_generic_services = true;
+
+// ============================================================================
+// raft.proto：Raft 算法层内部通信的消息定义（节点和节点之间的"网络协议"）
+//
+// 大白话：Raft 算法的核心就是节点之间互相发消息（请求投票、追加日志、心跳、
+// 快照……）。这个文件就是这些消息的"信封格式"。它被 raft/ 目录下的算法代码
+// 使用，也被 apply/transport 用来在网络上传输。看懂 Message 的字段，
+// 基本就看懂了 Raft 节点间在聊什么。
+// ============================================================================
+
+/* 角色类型：一个节点在某一时刻只能是下面四种之一 */
+enum RaftRole {
+  Follower = 0;     // 追随者：默认状态，听 leader 的
+  Candidate = 1;    // 候选者：选举超时后发起选举时的状态
+  Leader = 2;       // 领导者：集群的"老大"，负责接收写请求、复制日志
+  PreCandidate = 3; // 预候选者：pre-vote 机制下的"预选举"状态（正式选举前先探探路，防止干扰）
+}
+
+/* 消息类型：节点间互发的每一种消息都有编号。
+   这是整个项目最重要的枚举，建议对照 Raft 论文理解 */
+enum MessageType {
+  MsgHup = 0;            // 本地消息："开始选举"（超时后自己发给自己的）
+  MsgBeat = 1;           // 本地消息："发心跳"（leader 的定时器触发的）
+  MsgProp = 2;           // 本地消息："提案"（客户端写请求进入 Raft 的第一步）
+  MsgApp = 3;            // 追加日志 RPC：leader 把新日志发给 follower
+  MsgAppResp = 4;        // 追加日志的回复：follower 告诉 leader 收到/拒绝了
+  MsgVote = 5;           // 请求投票 RPC：candidate 拉票用
+  MsgVoteResp = 6;       // 投票回复：投赞成票或反对票
+  MsgSnap = 7;           // 快照 RPC：follower 日志落后太多，leader 直接发快照
+  MsgHeartbeat = 8;      // 心跳：leader 定期通知 follower "我还活着"
+  MsgHeartbeatResp = 9;  // 心跳回复
+  MsgUnreachable = 10;   // 本地消息：报告某个节点不可达
+  MsgSnapStatus = 11;    // 本地消息：报告快照发送成功/失败
+  MsgCheckQuorum = 12;   // 本地消息：leader 检查集群是否还有多数派存活
+  MsgTransferLeader = 13;// 领导权转移请求
+  MsgTimeoutNow = 14;    // leader 通知目标节点"立刻发起选举"（转移领导权用）
+  MsgReadIndex = 15;     // 线性一致读请求（先取一个"安全读位置"）
+  MsgReadIndexResp = 16; // 读索引回复
+  MsgPreVote = 17;       // 预投票请求（pre-vote）
+  MsgPreVoteResp = 18;   // 预投票回复
+  MsgTypeSize = 19;      // 占位：枚举元素个数
+}
+
+/* 节点间通信消息结构：所有消息都用这一个信封 */
+message Message {
+  MessageType type = 1;   // 消息类型（上面枚举里的某一种）
+  uint64 to = 2;          // 发给谁（节点 id）
+  uint64 from = 3;        // 谁发的（节点 id）
+  uint64 term = 4;        // 发送方当前的任期号（Raft 用任期判断消息新旧）
+  uint64 logterm = 5;     // 日志任期：配合 index 使用（如 append 前一条日志的任期、投票时自己的最后日志任期）
+  uint64 index = 6;       // 日志索引：随消息类型含义不同（append 的前一条索引 / 投票者的最后日志索引 / 快照索引等）
+  repeated Entry entries = 7;  // 携带的日志条目（append 时带新日志，readindex 时带请求上下文）
+  uint64 commit = 8;      // 发送方的提交索引（让接收方更新自己的 commit）
+  Snapshot snapshot = 9;  // 快照消息时携带的快照数据
+  bool reject = 10;       // 是否拒绝（如投票拒绝、append 拒绝）
+  uint64 rejecthint = 11; // 拒绝时的提示（如 append 被拒时告诉 leader 自己日志的最后索引，方便 leader 回退）
+  bytes context = 12;     // 附加上下文（readindex 请求的标识、转移领导权标识等）
+  uint64 vote = 13;       // 投票给了谁（硬状态里用的）
+}
+
+/* 日志条目类型 */
+enum EntryType {
+  EntryNormal = 0;           // 普通日志：里面是客户端的读写请求数据
+  EntryConfChange = 1;       // 配置变更日志：里面是"加节点/减节点"的指令
+  EntryWarningReadIndex = 2; // 读索引警告：appliedIndex 还没追上 readIndex，拒绝本次读
+}
+
+/* 日志条目：Raft 日志里的最小单位。
+   一条日志 = 一个"任期 + 一个索引 + 一段数据"。
+   term+index 唯一确定一条日志，这是 Raft 一致性的基石 */
+message Entry {
+  EntryType type = 1;   // 类型：普通数据 or 配置变更
+  uint64 term = 2;      // 这条日志是哪个任期写入的
+  uint64 index = 3;     // 这条日志是第几条（从 1 开始，全局递增）
+  bytes data = 4;       // 内容：客户端请求（RaftEntryData）序列化后的字节
+  string message = 5;   // 附带信息（如 readindex 被拒绝时的原因）
+}
+
+/* 硬状态：必须持久化到磁盘的状态（掉电也不能丢）。
+   因为 raft 的恢复完全依赖它：term、vote、commit 三项 */
+message HardState {
+  uint64 term = 1;    // 当前任期
+  uint64 vote = 2;    // 本届任期投给了谁（没投过为 0）
+  uint64 commit = 3;  // 已提交的日志索引（多数派都确认了）
+}
+
+/* 软状态: 不需要持久化到 WAL，只是运行信息，重启后可以从头再来 */
+message SoftState {
+  uint64 lead = 1;    // 当前集群的 leader 是谁（0 表示还不知道）。多线程访问要注意原子操作
+  RaftRole state = 2; // 当前角色：Follower/Candidate/Leader/PreCandidate
+}
+
+/* 集群配置变更: 比如给集群加一个新节点 */
+enum ConfChangeType { ConfChangeAddNode = 0; }  // 目前只支持加节点类型
+
+message ConfChange {
+  uint64 id = 1;        // 变更编号
+  ConfChangeType type = 2;  // 变更类型
+  uint64 nodeId = 3;    // 要操作的目标节点 id
+  bytes context = 4;    // 附加信息（新节点的地址 "ip:传输端口:客户端端口"）
+}
+
+/* 对端节点上下文：描述集群里另一个节点怎么联系它 */
+message PeerContext {
+  uint64 id = 1;               // 节点ID
+  string address = 2;          // IP地址
+  uint32 portfortransport = 3; // 节点间通信端口（raft 消息走的端口）
+  uint32 portforclient = 4;    // 客户端通信端口（对外服务的端口）
+  bytes context = 5;           // 节点上下文数据
+}
+
+message RaftStatus {
+  uint64 id = 1; // 节点ID
+}
+////////////////////////////////////////////////////
+// 节点间传输层消息：TransportService 的收发格式。
+// TransportRequest 把一个 Message 包一层再发出去
+message TransportRequest { Message msg = 1; }
+message TransportResponse { string status = 1; }
+
+// 节点间通信 RPC 服务：节点 A 调 B 的这个接口，把 raft 消息传给 B
+service TransportService {
+  rpc MessageChannel(TransportRequest) returns (TransportResponse);
+}
