@@ -6,6 +6,7 @@
 #include <boost/filesystem.hpp>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <thread>
 
 namespace kv {
@@ -71,6 +72,14 @@ class RaftNodeImpl : public RaftNode {
     WALptr wal_;          // WAL 管理器
 
     std::string dbPath_;  // DB 路径（实际未使用，可忽略）
+
+    // ---- 组提交(group commit)相关 ----
+    // 大白话：每条日志单独 fsync 一次的话，写吞吐会被磁盘 fsync 卡在几十条/秒。
+    // 这里把客户端写请求先攒进 pendingProposals_，由一个 flush 一次性把整批
+    // Propose 完，再统一处理 Ready —— 整批日志共用一次 fsync，吞吐成倍提升。
+    std::mutex proposalsMutex_;                                            // 保护下面两个字段
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> pendingProposals_;  // 攒着的写请求
+    bool flushScheduled_ = false;                                          // 是否已排队一个 flush
 
    public:
     // ------------------------------------------------------------------
@@ -443,18 +452,25 @@ class RaftNodeImpl : public RaftNode {
         }
     }
 
-    // 处理写提案（客户端 Set/Del）：投递到 raft 线程 → Propose → 处理 Ready
+    // 处理写提案（客户端 Set/Del）：攒批 + 组提交
+    // 不在 raft 线程时先把请求塞进 pendingProposals_（只排一个 flush 任务），
+    // 由 FlushProposals 在 raft 线程上一次性把整批 Propose 出去。
     void ProcessProposal(std::shared_ptr<std::vector<uint8_t>> data) {
-        // 默认是 brpc 线程进来时，这个条件成立;
-        // 如果当前线程不是 raft 线程，就投递到 raft 线程执行；否则直接执行;
         if (pthreadId_ != pthread_self()) {
-            auto cb = [this, data]() {
-                Status status = node_->Propose(data);
-                PullReadyEvents();
-            };
-            ioService_.post(cb);
+            bool need_post = false;
+            {
+                std::lock_guard<std::mutex> lock(proposalsMutex_);
+                pendingProposals_.push_back(std::move(data));
+                if (!flushScheduled_) {  // 已经排了一个 flush 就不再重复排
+                    flushScheduled_ = true;
+                    need_post = true;
+                }
+            }
+            if (need_post) {
+                ioService_.post([this]() { FlushProposals(); });
+            }
         } else {
-            // todo 处理client put()
+            // 已经在 raft 线程：直接提案并处理（不攒批）
             Status status = node_->Propose(data);
             PullReadyEvents();
         }
@@ -499,6 +515,30 @@ class RaftNodeImpl : public RaftNode {
     uint64_t NodeId() final { return id_; }
 
    private:
+    // ------------------------------------------------------------------
+    // FlushProposals：组提交的核心
+    // 把攒下来的所有写请求一次性 Propose，再统一处理一次 Ready。
+    // raft 的 Ready 会把这一批全部 entries 打包在一起交给 WAL，
+    // 所以整批只 fsync 一次（而不是每条日志一次）。
+    // ------------------------------------------------------------------
+    void FlushProposals() {
+        assert(pthreadId_ == pthread_self());
+
+        std::vector<std::shared_ptr<std::vector<uint8_t>>> batch;
+        {
+            std::lock_guard<std::mutex> lock(proposalsMutex_);
+            batch.swap(pendingProposals_);
+            flushScheduled_ = false;  // 允许处理期间新到的请求再排下一个 flush
+        }
+
+        for (auto& data : batch) {
+            node_->Propose(data);
+        }
+        // 一次 PullReadyEvents：Ready 里带上这一批的全部 entries，
+        // wal_->Save() 因此只做一次 fsync
+        PullReadyEvents();
+    }
+
     // ------------------------------------------------------------------
     // StartTimer：启动定时器（每 100ms 触发一次）
     // 大白话: 这是整个系统的"心跳"——每个 tick 驱动 raft 时钟
