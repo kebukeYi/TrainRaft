@@ -48,6 +48,8 @@ class RaftNodeImpl : public RaftNode {
     pthread_t pthreadId_;  // 主事件循环线程 id(用于判断是否在自己线程)
     boost::asio::io_service ioService_;            // 主线程事件循环, 用来消费 raft 的任务;
     boost::asio::deadline_timer timer_;            // 定时器(驱动 Tick, 以及控制任务消费的频率)
+    int tickMs_ = 100;                             // 时钟周期(ms)，可用 KV_TICK_MS 覆盖
+    bool weakReadInline_ = false;                  // 弱读是否在调用线程直接执行(实验开关)
 
     uint64_t id_;                                  // 本节点 id
     std::vector<std::string> peers_;               // 集群地址列表
@@ -139,10 +141,40 @@ class RaftNodeImpl : public RaftNode {
         // ---- 填配置 ----
         Config& conf = Config::GetInstance();
         conf.id = id;
-        // 选举超时 = 10 个时钟（每个时钟 100ms = 1 秒）
+
+        // 时钟周期与时钟数都可用环境变量覆盖，用来做实验：
+        // 定时器既驱动 raft 时钟(心跳/选举)，又负责消费 Ready 回包。
+        // 只把 TICK_MS 调小会让墙钟心跳/选举超时同步变小 → 集群乱选主，实验不干净。
+        // 要做等比例实验，请把 CLOCK 数一起放大，例如：
+        //   KV_TICK_MS=10 KV_ELECTION_TICK=100 KV_HEARTBEAT_TICK=10
+        //   → 墙钟心跳仍 100ms、选举超时仍 1000ms，仅回包消费快 10 倍。
+        if (const char* v = std::getenv("KV_TICK_MS")) {
+            int ms = std::atoi(v);
+            if (ms > 0) {
+                tickMs_ = ms;
+            }
+        }
+        // 实验开关：弱读不走 raft 线程(不 post)，直接在 brpc 工作线程上执行。
+        // 用于验证"单 raft 线程"是不是读路径的瓶颈。默认关闭，语义不变。
+        if (const char* v = std::getenv("KV_WEAK_READ_INLINE")) {
+            weakReadInline_ = (std::atoi(v) != 0);
+        }
+        // 选举超时 = electionTick 个时钟（默认 10 × 100ms = 1 秒）
         conf.electionTick = 10;
-        // 心跳间隔 = 1 个时钟（100ms）
+        if (const char* v = std::getenv("KV_ELECTION_TICK")) {
+            int n = std::atoi(v);
+            if (n > 0) {
+                conf.electionTick = n;
+            }
+        }
+        // 心跳间隔 = heartbeatTick 个时钟（默认 1 × 100ms）
         conf.heartbeatTick = 1;
+        if (const char* v = std::getenv("KV_HEARTBEAT_TICK")) {
+            int n = std::atoi(v);
+            if (n > 0) {
+                conf.heartbeatTick = n;
+            }
+        }
         // 内存存储
         conf.storage = storage_;
         conf.applied = 0;
@@ -175,6 +207,14 @@ class RaftNodeImpl : public RaftNode {
         if (!status.IsOk()) {
             LOG_FATAL("invalid configure %s", status.ToString().c_str());
         }
+
+        // 打印生效的时间参数，便于核对环境变量是否真的生效
+        LOG_INFO(
+            "node %lu timing: tickMs=%d electionTick=%u heartbeatTick=%u "
+            "(wall: heartbeat=%dms election=%dms) weakReadInline=%d",
+            id, tickMs_, (unsigned)conf.electionTick,
+            (unsigned)conf.heartbeatTick, tickMs_ * (int)conf.heartbeatTick,
+            tickMs_ * (int)conf.electionTick, (int)weakReadInline_);
 
         // ---- 构造对端节点上下文(每个节点的地址信息)----
         std::vector<proto::PeerContext> peersCtx;
@@ -503,6 +543,15 @@ class RaftNodeImpl : public RaftNode {
     // 处理弱读: 不经过 Raft，直接在本地状态机上执行读取
     // （包成一个普通 Entry 交给状态机，由状态机解析并回包）
     void ProcessWeakRead(std::shared_ptr<std::vector<uint8_t>> data) {
+        // KV_WEAK_READ_INLINE=1 时跳过 raft 线程，直接在当前线程执行(实验用)
+        if (weakReadInline_ || pthreadId_ == pthread_self()) {
+            std::shared_ptr<proto::Entry> entry = std::make_shared<proto::Entry>();
+            entry->set_type(proto::EntryType::EntryNormal);
+            entry->set_index(appliedIndex_);
+            entry->set_data(std::string(data->begin(), data->end()));
+            stateMachine_->ApplyStateMachine(entry);
+            return;
+        }
         if (pthreadId_ != pthread_self()) {
             auto cb = [this, data]() {
                 std::shared_ptr<proto::Entry> entry =
@@ -568,8 +617,8 @@ class RaftNodeImpl : public RaftNode {
             this->PullReadyEvents();
         };
         
-        // 100毫秒执行一次;
-        timer_.expires_from_now(boost::posix_time::millisec(100));
+        // 每隔 tickMs_ 毫秒执行一次（默认 100ms，可用 KV_TICK_MS 覆盖）
+        timer_.expires_from_now(boost::posix_time::millisec(tickMs_));
         // 异步执行;
         timer_.async_wait(handler);
     }

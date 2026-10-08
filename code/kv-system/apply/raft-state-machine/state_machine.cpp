@@ -202,7 +202,15 @@ void StateMachine::ApplyStateMachine(std::shared_ptr<proto::Entry> entry) {
 
     // 回复客户端: 只有发起节点有登记，执行 brpc 的 done 回调;
     if (need_reply) {
-        LOG_INFO("回复客户端, 请求ID: %d", entryData.requestid());
+        // 每次回包都打日志，压测时是热路径上的开销；
+        // 用 KV_LOG_REPLY=0 可关掉（默认开，保持原行为）
+        static const bool logReply = [] {
+            const char* v = std::getenv("KV_LOG_REPLY");
+            return !(v && std::string(v) == "0");
+        }();
+        if (logReply) {
+            LOG_INFO("回复客户端, 请求ID: %d", entryData.requestid());
+        }
         replyMeta.done->Run();
     }
 }
