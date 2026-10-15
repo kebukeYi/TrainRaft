@@ -594,7 +594,7 @@ class RaftNodeImpl : public RaftNode {
             node_->Propose(data);
         }
         // 一次 PullReadyEvents: Ready 里带上这一批的全部 entries,
-        // wal_->Save() 因此只做一次 fsync
+        // wal_->Save() 因此只做一次 fsync;
         PullReadyEvents();
     }
 
@@ -764,7 +764,7 @@ class RaftNodeImpl : public RaftNode {
                 // 已应用超过安全水位：可以安全读取
                 entry->set_type(proto::EntryType::EntryNormal);
             } else {
-                // 还没追上: 拒绝本次读（否则会读到旧数据）,
+                // 还没追上: 拒绝本次读（否则会读到旧数据）
                 entry->set_type(proto::EntryType::EntryWarningReadIndex);
                 entry->set_message(
                     "appliedIndex is less than readIndex, "

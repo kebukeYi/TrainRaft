@@ -16,8 +16,7 @@ void ReadOnly::LastPendingRequestCtx(std::vector<uint8_t>& ctx) {
     if (readIndexQueue.empty()) {
         return;
     }
-    ctx.insert(ctx.end(), readIndexQueue.back().begin(),
-               readIndexQueue.back().end());
+    ctx.insert(ctx.end(), readIndexQueue.back().begin(), readIndexQueue.back().end());
 }
 
 /*
@@ -80,8 +79,7 @@ std::vector<ReadIndexStatusPtr> ReadOnly::Advance(const proto::Message& msg) {
         readIndexQueue.erase(readIndexQueue.begin(),readIndexQueue.begin() + i);
         // 从映射表里删掉对应的记录
         for (ReadIndexStatusPtr& rs : rss) {
-            std::string str(rs->req.entries(0).data().begin(),
-                            rs->req.entries(0).data().end());
+            std::string str(rs->req.entries(0).data().begin(), rs->req.entries(0).data().end());
             pendingReadIndex.erase(str);
         }
     }
@@ -89,8 +87,7 @@ std::vector<ReadIndexStatusPtr> ReadOnly::Advance(const proto::Message& msg) {
 }
 
 // AddRequest：leader 登记一个新的读请求
-void ReadOnly::AddRequest(uint64_t index,
-                          std::shared_ptr<proto::Message>& msg) {
+void ReadOnly::AddRequest(uint64_t index, std::shared_ptr<proto::Message>& msg) {
     // 请求标识存在 MsgReadIndex 第一条 entry 的 data 里
     std::string ctx = msg->entries(0).data();
     auto it = pendingReadIndex.find(ctx);

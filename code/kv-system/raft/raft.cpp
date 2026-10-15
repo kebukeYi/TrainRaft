@@ -726,11 +726,9 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                         // 记下当前 commit
                         // 索引当"安全水位"，广播带身份证的心跳等确认
                         // 安全模式（ReadIndex）：
-                        // 1. 把当前 commit
-                        // 索引登记为读请求的"安全水位"
+                        // 1. 把当前 commit 索引登记为读请求的"安全水位"
                         // 2. 广播带请求标识的心跳
-                        // 3. 等大多数节点确认（commit
-                        // 没变）
+                        // 3. 等大多数节点确认（commit没变）
                         // 4. 确认后即可安全读取
                         // 先收下这个 只读请求,
                         // 然后再等待广播响应,然后再返回,
@@ -747,8 +745,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                         // 少一轮确认（有时钟漂移风险）
                         if (msg->from() == 0 || msg->from() == id_) {
                             // 本地发起的读:
-                            // 直接把当前 commit
-                            // 作为读结果
+                            // 直接把当前 commit 作为读结果;
                             readStates_.push_back(
                                 ReadState{.index = raftLog_->committed_,
                                           .requestCtx = std::vector<uint8_t>(
@@ -912,7 +909,7 @@ Status Raft::StepLeader(std::shared_ptr<proto::Message> msg) {
                 return Status::Ok();  // 还没到多数派，继续等;
             }
 
-            // 到多数派了: 解锁该请求及之前的所有请求
+            // 到多数派了: 解锁该请求及之前的所有请求;
             std::vector<ReadIndexStatusPtr> rss = readOnly_->Advance(*msg);
 
             // 判断每一个请求是否是发给自己的（本地读）还是发给别的节点(远程读)转发到这里的;
